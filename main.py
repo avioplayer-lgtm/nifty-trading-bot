@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import time
 from datetime import datetime
+import pytz
 
 # ---------------- TELEGRAM CONFIG ----------------
 BOT_TOKEN = "8748334869:AAFmCuoybJ-R-oMBJDbbfxVpo7grnSnmNHM"
@@ -16,39 +17,76 @@ def send_telegram(message):
     except:
         print("Telegram error")
 
+# ---------------- TIMEZONE ----------------
+IST = pytz.timezone("Asia/Kolkata")
+
 # ---------------- HELPER ----------------
 def get_atm_strike(price):
     return round(price / 50) * 50
 
-last_signal = ""
+def wait_for_next_candle():
+    now = datetime.now(IST)
+    seconds = now.minute * 60 + now.second
+    next_run = ((seconds // 300) + 1) * 300
+    sleep_time = next_run - seconds
+    time.sleep(sleep_time)
 
-# ---------------- START ----------------
-send_telegram("🚀 Bot started (Production Mode)")
-print("Bot started (Production Mode)...")
+# ---------------- FLAGS ----------------
+last_signal = ""
+sent_start_msg = False
+sent_end_msg = False
+sent_0910 = False
+sent_0915 = False
 
 # ---------------- LOOP ----------------
 while True:
-    now = datetime.now()
+    now = datetime.now(IST)
+    current_time = now.strftime("%H:%M")
 
-    # ✅ MARKET HOURS ONLY
-    if 9 <= now.hour <= 15:
+    # 🔔 PRE-MARKET REMINDERS
+    if current_time >= "09:10" and not sent_0910:
+        send_telegram("🔔 09:10 Reminder: Market opens soon. Get ready.")
+        print("09:10 reminder sent")
+        sent_0910 = True
+
+    if current_time >= "09:15" and not sent_0915:
+        send_telegram("🔔 09:15 Reminder: Market opened. Stay sharp.")
+        print("09:15 reminder sent")
+        sent_0915 = True
+
+    # 🚀 START MESSAGE
+    if "09:20" <= current_time <= "09:25" and not sent_start_msg:
+        send_telegram("🚀 Bot started. Monitoring market now.")
+        print("Bot started message sent")
+        sent_start_msg = True
+
+    # 🛑 END OF DAY
+    if current_time > "15:30" and not sent_end_msg:
+        send_telegram("🛑 Market closed. Bot going standby.")
+        print("Market closed message sent")
+        sent_end_msg = True
+
+    # 🔄 RESET FLAGS NEXT DAY
+    if current_time < "09:00":
+        sent_start_msg = False
+        sent_end_msg = False
+        sent_0910 = False
+        sent_0915 = False
+
+    # ⚔️ MAIN TRADING LOGIC
+    if "09:20" <= current_time <= "15:25":
 
         try:
-            # FETCH DATA
             df = yf.download("^NSEI", interval="5m", period="1d", auto_adjust=True, progress=False)
-
-            # FIX MULTI-INDEX ISSUE
             df.columns = df.columns.get_level_values(0)
-
-            # CLEAN DATA
             df = df.dropna()
 
             if len(df) < 10:
                 print("Not enough data...")
-                time.sleep(60)
+                wait_for_next_candle()
                 continue
 
-            # ORB LEVELS (First 15 min)
+            # ORB
             orb_high = df.iloc[:3]['High'].max()
             orb_low = df.iloc[:3]['Low'].min()
 
@@ -66,7 +104,7 @@ while True:
             else:
                 trend = "sideways"
 
-            # CANDLE STRENGTH
+            # CANDLE
             open_price = last['Open']
             close_price = last['Close']
             high_price = last['High']
@@ -81,7 +119,7 @@ while True:
             curr_vol = last['Volume']
             high_volume = curr_vol > avg_vol
 
-            # CONFIDENCE SCORE
+            # CONFIDENCE
             confidence = 0
 
             if close_price > orb_high or close_price < orb_low:
@@ -97,7 +135,6 @@ while True:
             if high_volume:
                 confidence += 2
 
-            # ENTRY LOGIC
             entry = close_price
             atm = get_atm_strike(entry)
 
@@ -116,7 +153,7 @@ while True:
                     stop_loss = entry + 40
                     target = entry - 80
 
-            # SEND ALERT (NO DUPLICATES)
+            # 📡 ALERT
             if option != "NO TRADE" and option != last_signal:
                 msg = f"""
 🚨 TRADE ALERT 🚨
@@ -132,11 +169,10 @@ Target: {round(target,2)}
                 send_telegram(msg)
                 last_signal = option
 
-            # LOG
-            print(f"{now.strftime('%H:%M:%S')} | Price: {round(entry,2)} | Trend: {trend} | Conf: {confidence} | {option}", flush=True)
+            print(f"{now.strftime('%H:%M:%S')} | {round(entry,2)} | {trend} | {confidence} | {option}", flush=True)
 
         except Exception as e:
             print("Error:", e)
 
-    # ⏱️ WAIT 5 MINUTES
-    time.sleep(300)
+    # ⏱️ WAIT FOR NEXT CANDLE
+    wait_for_next_candle()
