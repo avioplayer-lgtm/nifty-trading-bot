@@ -43,27 +43,33 @@ while True:
     now = datetime.now(IST)
     current_time = now.strftime("%H:%M")
 
-    # 🔔 PRE-MARKET REMINDERS
-    if current_time >= "09:10" and not sent_0910:
+    # 🚫 WEEKEND BLOCK
+    if now.weekday() >= 5:
+        time.sleep(300)
+        continue
+
+    # 🔔 09:10 REMINDER
+    if "09:10" <= current_time < "09:11" and not sent_0910:
         send_telegram("🔔 09:10 Reminder: Market opens soon. Get ready.")
         print("09:10 reminder sent")
         sent_0910 = True
 
-    if current_time >= "09:15" and not sent_0915:
+    # 🔔 09:15 REMINDER
+    if "09:15" <= current_time < "09:16" and not sent_0915:
         send_telegram("🔔 09:15 Reminder: Market opened. Stay sharp.")
         print("09:15 reminder sent")
         sent_0915 = True
 
     # 🚀 START MESSAGE
-    if "09:20" <= current_time <= "09:25" and not sent_start_msg:
+    if "09:20" <= current_time < "09:21" and not sent_start_msg:
         send_telegram("🚀 Bot started. Monitoring market now.")
-        print("Bot started message sent")
+        print("Start message sent")
         sent_start_msg = True
 
     # 🛑 END OF DAY
-    if current_time > "15:30" and not sent_end_msg:
+    if "15:30" <= current_time < "15:31" and not sent_end_msg:
         send_telegram("🛑 Market closed. Bot going standby.")
-        print("Market closed message sent")
+        print("End message sent")
         sent_end_msg = True
 
     # 🔄 RESET FLAGS NEXT DAY
@@ -174,5 +180,5 @@ Target: {round(target,2)}
         except Exception as e:
             print("Error:", e)
 
-    # ⏱️ WAIT FOR NEXT CANDLE
+    # ⏱️ SYNC WITH NEXT 5-MIN CANDLE
     wait_for_next_candle()
