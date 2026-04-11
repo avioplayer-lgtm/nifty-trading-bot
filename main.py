@@ -26,7 +26,7 @@ def wait_next():
     next_run = ((sec // 300) + 1) * 300
     time.sleep(next_run - sec)
 
-# ---------------- GLOBAL STATE ----------------
+# ---------------- STATE ----------------
 last_signal = ""
 trade_count = 0
 last_trade_time = 0
@@ -34,6 +34,11 @@ last_trade_time = 0
 oi_resistance = None
 oi_support = None
 last_oi_fetch = 0
+
+# heartbeat flags
+sent_start = False
+sent_stop = False
+last_heartbeat_hour = -1
 
 # ---------------- SMART STRIKE ----------------
 def get_strike(price, conf, type):
@@ -57,7 +62,7 @@ def get_oi():
 
         s = requests.Session()
         s.get("https://www.nseindia.com", headers=headers)
-        time.sleep(random.uniform(1,2))
+        time.sleep(random.uniform(1, 2))
 
         data = s.get(url, headers=headers).json()
 
@@ -84,24 +89,42 @@ def get_oi():
     except:
         return None, None
 
-# ---------------- MAIN LOOP ----------------
+# ---------------- START ----------------
 print("Bot started...")
 
 while True:
+
     now = datetime.now(IST)
     time_str = now.strftime("%H:%M")
 
-    # WEEKEND
+    # ---------------- WEEKEND ----------------
     if now.weekday() >= 5:
         time.sleep(300)
         continue
 
-    # RESET DAILY
+    # ---------------- DAILY RESET ----------------
     if time_str < "09:00":
         trade_count = 0
+        sent_start = False
+        sent_stop = False
 
-    # TRADING WINDOW
-    if "09:20" <= time_str <= "14:30":
+    # ---------------- START MESSAGE ----------------
+    if "09:15" <= time_str < "09:16" and not sent_start:
+        send_telegram("🚀 Bot started. Monitoring market.")
+        sent_start = True
+
+    # ---------------- HEARTBEAT ----------------
+    if now.hour != last_heartbeat_hour:
+        send_telegram(f"💓 Bot alive at {now.strftime('%H:%M')}")
+        last_heartbeat_hour = now.hour
+
+    # ---------------- STOP MESSAGE ----------------
+    if "15:30" <= time_str < "15:31" and not sent_stop:
+        send_telegram("🛑 Market closed. Bot stopped trading.")
+        sent_stop = True
+
+    # ---------------- TRADING WINDOW ----------------
+    if "09:20" <= time_str <= "15:30":
 
         try:
             df = yf.download("^NSEI", interval="5m", period="1d", progress=False)
@@ -143,30 +166,32 @@ while True:
             conf = 0
             if last['Close'] > orb_high or last['Close'] < orb_low:
                 conf += 3
+
             if (trend == "bullish" and last['Close'] > orb_high) or \
                (trend == "bearish" and last['Close'] < orb_low):
                 conf += 3
+
             if strong:
                 conf += 2
+
             if vol:
                 conf += 2
 
-            # FETCH OI
+            # ---------------- OI FETCH ----------------
             if time.time() - last_oi_fetch > 900:
                 oi_resistance, oi_support = get_oi()
                 last_oi_fetch = time.time()
 
-            # TRADE LIMIT
+            # ---------------- DISCIPLINE ----------------
             if trade_count >= 2:
                 wait_next()
                 continue
 
-            # COOLDOWN
             if time.time() - last_trade_time < 1800:
                 wait_next()
                 continue
 
-            # DECISION
+            # ---------------- DECISION ----------------
             entry = last['Close']
             sl = atr * 1.2
             tgt = atr * 2
@@ -195,7 +220,7 @@ while True:
                         SL = entry + sl
                         TARGET = entry - tgt
 
-            # ALERT
+            # ---------------- ALERT ----------------
             if option != "NO TRADE" and option != last_signal:
                 msg = f"""
 🚨 TRADE ALERT 🚨
