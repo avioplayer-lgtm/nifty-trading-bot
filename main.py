@@ -3,251 +3,294 @@ import pandas as pd
 import requests
 import time
 import random
+import os
+import logging
 from datetime import datetime
 import pytz
 
-# ---------------- TELEGRAM CONFIG ----------------
+# ---------------- CONFIG ----------------
 BOT_TOKEN = "8748334869:AAFmCuoybJ-R-oMBJDbbfxVpo7grnSnmNHM"
 CHAT_ID = "1209845315"
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=payload)
-    except:
-        print("Telegram error")
+capital = 100000
+risk_per_trade = 0.005  # start safe (0.5%)
 
-# ---------------- TIMEZONE ----------------
+max_trades = 3
+
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+def send_telegram(msg):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except:
+        pass
+
 IST = pytz.timezone("Asia/Kolkata")
 
-# ---------------- GLOBAL VARIABLES ----------------
+# ---------------- STATE ----------------
 last_signal = ""
-sent_start_msg = False
-sent_end_msg = False
-sent_0910 = False
-sent_0915 = False
+active_trade = None
 
-oi_resistance = None
-oi_support = None
+range_high = None
+range_low = None
+was_sideways = False
+
+oi_resistance, oi_support, oi_pcr = None, None, 1
 last_oi_fetch = 0
 
+trades_today = 0
+daily_loss = 0
+max_daily_loss = capital * 0.02
+
+current_day = None
+
 # ---------------- HELPERS ----------------
-def get_smart_strike(price, confidence, option_type):
-    base = round(price / 50) * 50
-
-    if confidence >= 8:
-        return base + 50 if option_type == "CE" else base - 50
-    elif confidence == 7:
-        return base
-    else:
-        return base - 50 if option_type == "CE" else base + 50
-
-def wait_for_next_candle():
+def wait_next():
     now = datetime.now(IST)
-    seconds = now.minute * 60 + now.second
-    next_run = ((seconds // 300) + 1) * 300
-    sleep_time = next_run - seconds
-    time.sleep(sleep_time)
+    sec = now.minute * 60 + now.second
+    nxt = ((sec // 300) + 1) * 300
+    time.sleep(nxt - sec)
 
-def get_option_chain():
-    url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+def get_time_weight(now):
+    t = now.hour + now.minute / 60
+    if 10 <= t <= 11.5: return 1.0
+    elif 13.5 <= t <= 14.5: return 0.9
+    elif 9.33 <= t < 10: return 0.6
+    else: return 0.8
 
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/"
-    }
+# ---------------- INDICATORS ----------------
+def compute(df):
+    df['ema9'] = df['Close'].ewm(span=9).mean()
+    df['ema21'] = df['Close'].ewm(span=21).mean()
 
-    session = requests.Session()
-    session.get("https://www.nseindia.com", headers=headers)
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
 
-    time.sleep(random.uniform(1, 2))
+    df['atr'] = (df['High'] - df['Low']).rolling(10).mean()
 
-    response = session.get(url, headers=headers).json()
-    data = response['records']['data']
+    df['cum_vol'] = df['Volume'].cumsum()
+    df['cum_pv'] = (df['Close'] * df['Volume']).cumsum()
+    df['vwap'] = df['cum_pv'] / df['cum_vol']
 
-    call_oi = {}
-    put_oi = {}
+    return df
 
-    for item in data:
-        strike = item.get('strikePrice')
+# ---------------- SIDEWAYS ----------------
+def is_sideways(df, atr, ema9, ema21):
+    r = df.iloc[-10:]
+    rng = r['High'].max() - r['Low'].min()
 
-        if item.get('CE'):
-            call_oi[strike] = item['CE']['openInterest']
+    cond1 = atr < rng * 0.25
+    cond2 = abs(ema9 - ema21) < atr * 0.3
+    cond3 = rng < atr * 3
 
-        if item.get('PE'):
-            put_oi[strike] = item['PE']['openInterest']
+    return sum([cond1, cond2, cond3]) >= 2
 
-    max_call = max(call_oi, key=call_oi.get)
-    max_put = max(put_oi, key=put_oi.get)
+# ---------------- OI ----------------
+def get_oi():
+    try:
+        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        s = requests.Session()
+        s.get("https://www.nseindia.com", headers=headers)
+        time.sleep(random.uniform(1,2))
+        data = s.get(url, headers=headers).json()['records']['data']
 
-    return max_call, max_put
+        ce, pe = {}, {}
+        for i in data:
+            sp = i.get('strikePrice')
+            if i.get('CE'): ce[sp] = i['CE']['openInterest']
+            if i.get('PE'): pe[sp] = i['PE']['openInterest']
+
+        mc = max(ce, key=ce.get)
+        mp = max(pe, key=pe.get)
+        pcr = sum(pe.values()) / sum(ce.values())
+
+        return mc, mp, round(pcr,2)
+    except:
+        return None, None, 1
 
 # ---------------- MAIN LOOP ----------------
 while True:
     now = datetime.now(IST)
-    current_time = now.strftime("%H:%M")
+    t = now.strftime("%H:%M")
 
-    # WEEKEND BLOCK
+    # RESET DAILY
+    if current_day != now.date():
+        current_day = now.date()
+        trades_today = 0
+        daily_loss = 0
+        active_trade = None
+
     if now.weekday() >= 5:
         time.sleep(300)
         continue
 
-    # 🔔 REMINDERS
-    if "09:10" <= current_time < "09:11" and not sent_0910:
-        send_telegram("🔔 09:10 Reminder: Market opens soon.")
-        sent_0910 = True
+    # Avoid first 5 min noise
+    if "09:20" <= t <= "09:25":
+        wait_next()
+        continue
 
-    if "09:15" <= current_time < "09:16" and not sent_0915:
-        send_telegram("🔔 09:15 Reminder: Market opened.")
-        sent_0915 = True
+    if "09:20" <= t <= "15:25":
 
-    # 🚀 START
-    if "09:20" <= current_time < "09:21" and not sent_start_msg:
-        send_telegram("🚀 Bot started. Monitoring market.")
-        sent_start_msg = True
+        if daily_loss >= max_daily_loss:
+            send_telegram("🛑 DAILY LOSS LIMIT HIT. BOT STOPPED.")
+            break
 
-    # 🛑 END
-    if "15:30" <= current_time < "15:31" and not sent_end_msg:
-        send_telegram("🛑 Market closed. Bot standby.")
-        sent_end_msg = True
-
-    # RESET NEXT DAY
-    if current_time < "09:00":
-        sent_start_msg = False
-        sent_end_msg = False
-        sent_0910 = False
-        sent_0915 = False
-
-    # ⚔️ TRADING WINDOW
-    if "09:20" <= current_time <= "15:25":
+        if trades_today >= max_trades:
+            wait_next()
+            continue
 
         try:
-            df = yf.download("^NSEI", interval="5m", period="1d", auto_adjust=True, progress=False)
+            df = yf.download("^NSEI", interval="5m", period="1d", progress=False)
             df.columns = df.columns.get_level_values(0)
             df = df.dropna()
 
-            if len(df) < 10:
-                wait_for_next_candle()
+            if len(df) < 20:
+                wait_next()
                 continue
 
-            # ORB
+            df = compute(df)
+
+            last = df.iloc[-1]
+            close = float(last['Close'])
+            atr = float(last['atr'])
+            ema9 = float(last['ema9'])
+            ema21 = float(last['ema21'])
+            rsi = float(last['rsi'])
+            vwap = float(last['vwap'])
+
             orb_high = df.iloc[:3]['High'].max()
             orb_low = df.iloc[:3]['Low'].min()
 
-            last = df.iloc[-1]
-            recent = df.iloc[-10:]
+            sideways = is_sideways(df, atr, ema9, ema21)
 
-            # TREND
-            last_close = recent['Close'].iloc[-1]
-            mean_close = recent['Close'].mean()
+            if sideways:
+                range_high = df.iloc[-10:]['High'].max()
+                range_low = df.iloc[-10:]['Low'].min()
+                was_sideways = True
 
-            if last_close > mean_close:
-                trend = "bullish"
-            elif last_close < mean_close:
-                trend = "bearish"
-            else:
-                trend = "sideways"
+            range_breakout = False
+            if was_sideways and range_high and range_low:
+                if close > range_high or close < range_low:
+                    range_breakout = True
+                    was_sideways = False
 
-            # CANDLE
-            open_price = last['Open']
-            close_price = last['Close']
-            high_price = last['High']
-            low_price = last['Low']
+            global oi_resistance, oi_support, oi_pcr, last_oi_fetch
+            if time.time() - last_oi_fetch > 900:
+                oi_resistance, oi_support, oi_pcr = get_oi()
+                last_oi_fetch = time.time()
 
-            body = abs(close_price - open_price)
-            range_candle = high_price - low_price
-            strong_candle = body > (0.6 * range_candle) if range_candle > 0 else False
-
-            # VOLUME
-            avg_vol = df.iloc[-6:-1]['Volume'].mean()
-            curr_vol = last['Volume']
-            high_volume = curr_vol > avg_vol
-
-            # ATR
-            df['range'] = df['High'] - df['Low']
-            atr = df['range'].rolling(10).mean().iloc[-1]
+            time_weight = get_time_weight(now)
 
             # CONFIDENCE
-            confidence = 0
+            score = 0
 
-            if close_price > orb_high or close_price < orb_low:
-                confidence += 3
+            if close > orb_high or close < orb_low:
+                score += 25
 
-            if (trend == "bullish" and close_price > orb_high) or \
-               (trend == "bearish" and close_price < orb_low):
-                confidence += 3
+            if (close > orb_high and ema9 > ema21) or (close < orb_low and ema9 < ema21):
+                score += 20
 
-            if strong_candle:
-                confidence += 2
+            if (close > orb_high and rsi > 55) or (close < orb_low and rsi < 45):
+                score += 15
 
-            if high_volume:
-                confidence += 2
+            if range_breakout:
+                score += 10
 
-            # FETCH OI (every 15 min)
-            if time.time() - last_oi_fetch > 900:
-                try:
-                    oi_resistance, oi_support = get_option_chain()
-                    last_oi_fetch = time.time()
-                    print("OI updated:", oi_resistance, oi_support)
-                except:
-                    print("OI fetch failed")
+            score = int(score * time_weight)
+            confidence = min(score, 100)
 
-            # DECISION
-            entry = close_price
-            sl_buffer = atr * 1.2
-            target_buffer = atr * 2
+            min_conf = 55 if time_weight >= 0.9 else 60
 
+            # ENTRY
+            entry = close
+            sl = None
+            tgt = None
             option = "NO TRADE"
-            stop_loss = None
-            target = None
+            direction = None
 
-            if confidence >= 7:
+            if (confidence >= min_conf or range_breakout) and (not sideways or range_breakout):
 
-                # CALL
-                if entry > orb_high:
-                    if oi_resistance and (oi_resistance - entry < 50):
-                        option = "NO TRADE"
-                    else:
-                        strike = get_smart_strike(entry, confidence, "CE")
-                        option = f"{strike} CE"
-                        stop_loss = entry - sl_buffer
-                        target = min(entry + target_buffer, oi_resistance) if oi_resistance else entry + target_buffer
+                if close > orb_high and close > vwap:
+                    if not oi_resistance or (oi_resistance - close > 30):
+                        entry = close + 2
+                        sl = entry - atr
+                        tgt = entry + (atr * 2)
+                        direction = "CE"
+                        option = "CE"
 
-                # PUT
-                elif entry < orb_low:
-                    if oi_support and (entry - oi_support < 50):
-                        option = "NO TRADE"
-                    else:
-                        strike = get_smart_strike(entry, confidence, "PE")
-                        option = f"{strike} PE"
-                        stop_loss = entry + sl_buffer
-                        target = max(entry - target_buffer, oi_support) if oi_support else entry - target_buffer
+                elif close < orb_low and close < vwap:
+                    if not oi_support or (close - oi_support > 30):
+                        entry = close - 2
+                        sl = entry + atr
+                        tgt = entry - (atr * 2)
+                        direction = "PE"
+                        option = "PE"
 
-            # ALERT
-            if option != "NO TRADE" and option != last_signal:
+            # POSITION SIZE
+            if sl:
+                risk_amt = capital * risk_per_trade
+                dist = abs(entry - sl)
+                qty = int(risk_amt / dist) if dist > 0 else 0
+
+                if atr > close * 0.005:
+                    qty = int(qty * 0.7)
+                elif atr < close * 0.003:
+                    qty = int(qty * 1.2)
+            else:
+                qty = 0
+
+            # ENTRY ALERT
+            if option != "NO TRADE" and not active_trade:
                 msg = f"""
-🚨 TRADE ALERT 🚨
+🚨 TRADE ALERT
 
-Decision: {option}
-Trend: {trend}
-Confidence: {confidence}/10
-
-ATR: {round(atr,2)}
-OI Resistance: {oi_resistance}
-OI Support: {oi_support}
+Type: {option}
+Confidence: {confidence}
+Qty: {qty}
 
 Entry: {round(entry,2)}
-SL: {round(stop_loss,2)}
-Target: {round(target,2)}
+SL: {round(sl,2)}
+Target: {round(tgt,2)}
+
+VWAP Bias: {'Bullish' if close>vwap else 'Bearish'}
+PCR: {oi_pcr}
 """
                 send_telegram(msg)
-                last_signal = option
 
-            print(f"{now.strftime('%H:%M:%S')} | {round(entry,2)} | {trend} | {confidence} | {option}", flush=True)
+                active_trade = {
+                    "dir": direction,
+                    "entry": entry,
+                    "sl": sl,
+                    "tgt": tgt
+                }
+
+                trades_today += 1
+
+            # EXIT
+            if active_trade:
+                at = active_trade
+
+                if (at['dir']=="CE" and close<=at['sl']) or (at['dir']=="PE" and close>=at['sl']):
+                    send_telegram("🔴 STOP LOSS HIT")
+                    daily_loss += abs(at['entry'] - close)
+                    active_trade = None
+
+                elif (at['dir']=="CE" and close>=at['tgt']) or (at['dir']=="PE" and close<=at['tgt']):
+                    send_telegram("🟢 TARGET HIT")
+                    active_trade = None
+
+            logging.info(f"{t} | {close} | Conf:{confidence} | Trades:{trades_today}")
 
         except Exception as e:
-            print("Error:", e)
+            logging.error(e)
 
-    wait_for_next_candle()
+    wait_next()
