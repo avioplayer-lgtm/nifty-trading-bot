@@ -6,16 +6,28 @@ import random
 from datetime import datetime
 import pytz
 
-# ---------------- TELEGRAM ----------------
+# ---------------- CONFIG ----------------
 BOT_TOKEN = "8748334869:AAFmCuoybJ-R-oMBJDbbfxVpo7grnSnmNHM"
 CHAT_ID = "1209845315"
 
+capital = 30000
+risk_per_trade = 0.005
+max_daily_loss = capital * 0.02
+
+SYMBOLS = {
+    "NIFTY": "^NSEI",
+    "BANKNIFTY": "^NSEBANK"
+}
+
+# ---------------- TELEGRAM ----------------
 def send_telegram(msg):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg}
+        )
     except:
-        print("Telegram error")
+        pass
 
 # ---------------- TIME ----------------
 IST = pytz.timezone("Asia/Kolkata")
@@ -23,223 +35,209 @@ IST = pytz.timezone("Asia/Kolkata")
 def wait_next():
     now = datetime.now(IST)
     sec = now.minute * 60 + now.second
-    next_run = ((sec // 300) + 1) * 300
-    time.sleep(next_run - sec)
+    nxt = ((sec // 300) + 1) * 300
+    time.sleep(nxt - sec)
 
 # ---------------- STATE ----------------
-last_signal = ""
-trade_count = 0
-last_trade_time = 0
+active_trade = None
+daily_loss = 0
+current_day = None
 
-oi_resistance = None
-oi_support = None
-last_oi_fetch = 0
-
-# heartbeat flags
 sent_start = False
 sent_stop = False
 last_heartbeat_hour = -1
 
-# ---------------- SMART STRIKE ----------------
-def get_strike(price, conf, type):
-    base = round(price / 50) * 50
+# ---------------- INDICATORS ----------------
+def compute(df):
+    df['ema9'] = df['Close'].ewm(span=9).mean()
+    df['ema21'] = df['Close'].ewm(span=21).mean()
 
-    if conf >= 8:
-        return base + 50 if type == "CE" else base - 50
-    elif conf == 7:
-        return base
-    else:
-        return base - 50 if type == "CE" else base + 50
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
 
-# ---------------- OPTION CHAIN ----------------
-def get_oi():
+    df['atr'] = (df['High'] - df['Low']).rolling(10).mean()
+
+    df['cum_vol'] = df['Volume'].cumsum()
+    df['cum_pv'] = (df['Close'] * df['Volume']).cumsum()
+    df['vwap'] = df['cum_pv'] / df['cum_vol']
+
+    return df
+
+# ---------------- SIDEWAYS ----------------
+def is_sideways(df, atr, ema9, ema21):
+    r = df.iloc[-10:]
+    rng = r['High'].max() - r['Low'].min()
+
+    cond1 = atr < rng * 0.25
+    cond2 = abs(ema9 - ema21) < atr * 0.3
+    cond3 = rng < atr * 3
+
+    return sum([cond1, cond2, cond3]) >= 2
+
+# ---------------- SCAN ----------------
+def scan_symbol(name, symbol):
     try:
-        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.nseindia.com/"
+        df = yf.download(symbol, interval="5m", period="1d", progress=False)
+
+        if df.empty:
+            return None
+
+        df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+
+        if len(df) < 20:
+            return None
+
+        df = compute(df)
+
+        last = df.iloc[-1]
+        close = float(last['Close'])
+        atr = float(last['atr'])
+        ema9 = float(last['ema9'])
+        ema21 = float(last['ema21'])
+        rsi = float(last['rsi'])
+        vwap = float(last['vwap'])
+
+        orb_high = df.iloc[:3]['High'].max()
+        orb_low = df.iloc[:3]['Low'].min()
+
+        sideways = is_sideways(df, atr, ema9, ema21)
+
+        conf = 0
+        if close > orb_high or close < orb_low:
+            conf += 3
+        if (ema9 > ema21 and close > orb_high) or (ema9 < ema21 and close < orb_low):
+            conf += 3
+        if (rsi > 55 and close > orb_high) or (rsi < 45 and close < orb_low):
+            conf += 2
+
+        if conf < 7 or sideways:
+            return None
+
+        if close > orb_high and close > vwap:
+            entry = close + 2
+            sl = entry - atr
+            tgt = entry + atr * 2
+            direction = "CE"
+
+        elif close < orb_low and close < vwap:
+            entry = close - 2
+            sl = entry + atr
+            tgt = entry - atr * 2
+            direction = "PE"
+        else:
+            return None
+
+        return {
+            "symbol": name,
+            "confidence": conf,
+            "entry": entry,
+            "sl": sl,
+            "tgt": tgt,
+            "direction": direction
         }
 
-        s = requests.Session()
-        s.get("https://www.nseindia.com", headers=headers)
-        time.sleep(random.uniform(1, 2))
-
-        data = s.get(url, headers=headers).json()
-
-        if 'records' not in data:
-            return None, None
-
-        data = data['records']['data']
-
-        call_oi = {}
-        put_oi = {}
-
-        for item in data:
-            strike = item['strikePrice']
-            if item.get('CE'):
-                call_oi[strike] = item['CE']['openInterest']
-            if item.get('PE'):
-                put_oi[strike] = item['PE']['openInterest']
-
-        res = max(call_oi, key=call_oi.get)
-        sup = max(put_oi, key=put_oi.get)
-
-        return res, sup
-
     except:
-        return None, None
+        return None
 
-# ---------------- START ----------------
-print("Bot started...")
+# ---------------- MAIN ----------------
+print("Dual Signal Bot Started...")
 
 while True:
 
     now = datetime.now(IST)
-    time_str = now.strftime("%H:%M")
+    t = now.strftime("%H:%M")
 
-    # ---------------- WEEKEND ----------------
     if now.weekday() >= 5:
         time.sleep(300)
         continue
 
-    # ---------------- DAILY RESET ----------------
-    if time_str < "09:00":
-        trade_count = 0
+    # RESET DAILY
+    if current_day != now.date():
+        current_day = now.date()
+        daily_loss = 0
+        active_trade = None
         sent_start = False
         sent_stop = False
+        last_heartbeat_hour = -1
 
-    # ---------------- START MESSAGE ----------------
-    if "09:15" <= time_str < "09:16" and not sent_start:
-        send_telegram("🚀 Bot started. Monitoring market.")
+    # START / STOP
+    if "09:15" <= t < "09:16" and not sent_start:
+        send_telegram("🚀 Bot started.")
         sent_start = True
 
-    # ---------------- HEARTBEAT ----------------
-    if now.hour != last_heartbeat_hour:
-        send_telegram(f"💓 Bot alive at {now.strftime('%H:%M')}")
-        last_heartbeat_hour = now.hour
-
-    # ---------------- STOP MESSAGE ----------------
-    if "15:30" <= time_str < "15:31" and not sent_stop:
-        send_telegram("🛑 Market closed. Bot stopped trading.")
+    if "15:30" <= t < "15:31" and not sent_stop:
+        send_telegram("🛑 Market closed.")
         sent_stop = True
 
-    # ---------------- TRADING WINDOW ----------------
-    if "09:20" <= time_str <= "15:30":
+    # HEARTBEAT + RULES
+    if "09:20" <= t <= "15:25":
+        if now.hour != last_heartbeat_hour:
+            send_telegram("""
+💓 Bot Alive
+
+📌 RULES:
+1. Only ONE trade
+2. Pick BEST confidence
+3. No emotional override
+4. Respect SL
+""")
+            last_heartbeat_hour = now.hour
+
+    # TRADING WINDOW
+    if "09:20" <= t <= "15:25":
+
+        if daily_loss >= max_daily_loss:
+            send_telegram("🛑 Daily loss limit hit. Stopping.")
+            break
 
         try:
-            df = yf.download("^NSEI", interval="5m", period="1d", progress=False)
+            signals = []
 
-            if df.empty:
-                wait_next()
-                continue
+            for name, symbol in SYMBOLS.items():
+                result = scan_symbol(name, symbol)
+                if result:
+                    signals.append(result)
 
-            df.columns = df.columns.get_level_values(0)
-            df = df.dropna()
+            if signals:
+                best = max(signals, key=lambda x: x['confidence'])
 
-            if len(df) < 10:
-                wait_next()
-                continue
+                msg = "🚨 SIGNAL UPDATE\n\n"
 
-            # ORB
-            orb_high = df.iloc[:3]['High'].max()
-            orb_low = df.iloc[:3]['Low'].min()
-
-            last = df.iloc[-1]
-            recent = df.iloc[-10:]
-
-            # TREND
-            trend = "bullish" if last['Close'] > recent['Close'].mean() else "bearish"
-
-            # CANDLE
-            body = abs(last['Close'] - last['Open'])
-            range_ = last['High'] - last['Low']
-            strong = body > (0.6 * range_) if range_ > 0 else False
-
-            # VOLUME
-            vol = last['Volume'] > df.iloc[-6:-1]['Volume'].mean()
-
-            # ATR
-            df['range'] = df['High'] - df['Low']
-            atr = df['range'].rolling(10).mean().iloc[-1]
-
-            # CONFIDENCE
-            conf = 0
-            if last['Close'] > orb_high or last['Close'] < orb_low:
-                conf += 3
-
-            if (trend == "bullish" and last['Close'] > orb_high) or \
-               (trend == "bearish" and last['Close'] < orb_low):
-                conf += 3
-
-            if strong:
-                conf += 2
-
-            if vol:
-                conf += 2
-
-            # ---------------- OI FETCH ----------------
-            if time.time() - last_oi_fetch > 900:
-                oi_resistance, oi_support = get_oi()
-                last_oi_fetch = time.time()
-
-            # ---------------- DISCIPLINE ----------------
-            if trade_count >= 2:
-                wait_next()
-                continue
-
-            if time.time() - last_trade_time < 1800:
-                wait_next()
-                continue
-
-            # ---------------- DECISION ----------------
-            entry = last['Close']
-            sl = atr * 1.2
-            tgt = atr * 2
-
-            option = "NO TRADE"
-
-            if conf >= 7:
-
-                # CALL
-                if entry > orb_high:
-                    if oi_resistance and (oi_resistance - entry < 50):
-                        option = "NO TRADE"
-                    else:
-                        strike = get_strike(entry, conf, "CE")
-                        option = f"{strike} CE"
-                        SL = entry - sl
-                        TARGET = entry + tgt
-
-                # PUT
-                elif entry < orb_low:
-                    if oi_support and (entry - oi_support < 50):
-                        option = "NO TRADE"
-                    else:
-                        strike = get_strike(entry, conf, "PE")
-                        option = f"{strike} PE"
-                        SL = entry + sl
-                        TARGET = entry - tgt
-
-            # ---------------- ALERT ----------------
-            if option != "NO TRADE" and option != last_signal:
-                msg = f"""
-🚨 TRADE ALERT 🚨
-
-{option}
-Trend: {trend}
-Confidence: {conf}/10
-
-Entry: {round(entry,2)}
-SL: {round(SL,2)}
-Target: {round(TARGET,2)}
+                for s in signals:
+                    msg += f"""
+{s['symbol']}:
+Type: {s['direction']}
+Conf: {s['confidence']}
+Entry: {round(s['entry'],2)}
+SL: {round(s['sl'],2)}
+Target: {round(s['tgt'],2)}
 """
+
+                msg += f"\n⭐ BEST PICK: {best['symbol']} (Conf: {best['confidence']})\n"
+
+                if active_trade:
+                    msg += "\n⚠️ Trade already active. Do NOT take another."
+
                 send_telegram(msg)
 
-                last_signal = option
-                trade_count += 1
-                last_trade_time = time.time()
+            # EXIT TRACKING
+            if active_trade:
+                price = active_trade['entry']
 
-            print(f"{time_str} | {entry:.2f} | Conf:{conf} | Trades:{trade_count}", flush=True)
+                if (active_trade['direction']=="CE" and price <= active_trade['sl']) or \
+                   (active_trade['direction']=="PE" and price >= active_trade['sl']):
+                    send_telegram("🔴 SL HIT")
+                    daily_loss += abs(active_trade['entry'] - price)
+                    active_trade = None
+
+                elif (active_trade['direction']=="CE" and price >= active_trade['tgt']) or \
+                     (active_trade['direction']=="PE" and price <= active_trade['tgt']):
+                    send_telegram("🟢 TARGET HIT")
+                    active_trade = None
 
         except Exception as e:
             print("Error:", e)
